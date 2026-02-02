@@ -365,7 +365,7 @@ func (r *RegularStageReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Reconcile the Stage.
 	logger.Debug("reconciling Stage")
-	newStatus, needsRequeue, reconcileErr := r.reconcile(ctx, stage, time.Now())
+	newStatus, requeueAfter, reconcileErr := r.reconcile(ctx, stage, time.Now())
 	logger.Debug("done reconciling Stage")
 
 	// Record the current refresh token as having been handled.
@@ -389,20 +389,19 @@ func (r *RegularStageReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if reconcileErr != nil {
 		return ctrl.Result{}, reconcileErr
 	}
-	// Immediate requeue if needed.
-	if needsRequeue {
-		return ctrl.Result{RequeueAfter: 100 * time.Millisecond}, nil
+	// Requeue after the specified delay.
+	// Use a default of 5 minutes if no specific delay was requested.
+	if requeueAfter == 0 {
+		requeueAfter = 5 * time.Minute
 	}
-	// Otherwise, requeue after a delay.
-	// TODO: Make the requeue delay configurable.
-	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 func (r *RegularStageReconciler) reconcile(
 	ctx context.Context,
 	stage *kargoapi.Stage,
 	startTime time.Time,
-) (kargoapi.StageStatus, bool, error) {
+) (kargoapi.StageStatus, time.Duration, error) {
 	logger := logging.LoggerFromContext(ctx)
 	newStatus := *stage.Status.DeepCopy()
 
@@ -414,14 +413,14 @@ func (r *RegularStageReconciler) reconcile(
 		ObservedGeneration: stage.Generation,
 	})
 
-	var requestRequeue bool
+	var requeueAfter time.Duration
 	subReconcilers := []struct {
 		name      string
-		reconcile func() (kargoapi.StageStatus, error)
+		reconcile func() (kargoapi.StageStatus, time.Duration, error)
 	}{
 		{
 			name: "syncing Promotions",
-			reconcile: func() (kargoapi.StageStatus, error) {
+			reconcile: func() (kargoapi.StageStatus, time.Duration, error) {
 				status, hasPendingPromotions, err := r.syncPromotions(ctx, stage)
 				if err != nil {
 					err = fmt.Errorf("failed to sync Promotions: %w", err)
@@ -430,23 +429,23 @@ func (r *RegularStageReconciler) reconcile(
 				// then we should request an immediate requeue to ensure that we
 				// process the next Promotion as soon as possible.
 				if status.CurrentPromotion == nil && hasPendingPromotions {
-					requestRequeue = true
+					return status, 100 * time.Millisecond, err
 				}
-				return status, err
+				return status, 0, err
 			},
 		},
 		{
 			name: "syncing Freight",
-			reconcile: func() (kargoapi.StageStatus, error) {
+			reconcile: func() (kargoapi.StageStatus, time.Duration, error) {
 				if err := r.syncFreight(ctx, stage); err != nil {
-					return stage.Status, fmt.Errorf("failed to sync Freight: %w", err)
+					return stage.Status, 0, fmt.Errorf("failed to sync Freight: %w", err)
 				}
-				return stage.Status, nil
+				return stage.Status, 0, nil
 			},
 		},
 		{
 			name: "assessing health",
-			reconcile: func() (kargoapi.StageStatus, error) {
+			reconcile: func() (kargoapi.StageStatus, time.Duration, error) {
 				status := r.assessHealth(ctx, stage)
 				if status.Health != nil && status.Health.Status == kargoapi.HealthStateUnknown {
 					// If Stage health has evaluated to Unknown, there are two specific
@@ -476,49 +475,50 @@ func (r *RegularStageReconciler) reconcile(
 						// Scenario 2: There was no last Promotion or there was and it was
 						// successful. Whatever the reason the Stage health evaluated to
 						// Unknown, an unsuccessful Promotion wasn't it.
-						return status, errors.New("Stage health evaluated to Unknown") // nolint: staticcheck
+						return status, 0, errors.New("Stage health evaluated to Unknown") // nolint: staticcheck
 					}
 				}
 				// Health assessment was definitive OR scenario 1: Stage health is
 				// unknown specifically because the last Promotion did not succeed.
-				return status, nil
+				return status, 0, nil
 			},
 		},
 		{
 			name: "verifying Stage Freight",
-			reconcile: func() (kargoapi.StageStatus, error) {
+			reconcile: func() (kargoapi.StageStatus, time.Duration, error) {
 				status, err := r.verifyStageFreight(ctx, stage, startTime, time.Now)
 				if err != nil {
 					err = fmt.Errorf("failed to verify Stage Freight: %w", err)
 				}
 				// If we have a non-terminal verification for the current Freight,
 				// then we should rely on the watcher to requeue the Stage when the
-				// verification completes.
+				// verification completes. Set requeue to 0 to reset any previously
+				// requested requeue delay.
 				curFreightCol := status.FreightHistory.Current()
 				if curFreightCol != nil && curFreightCol.HasNonTerminalVerification() {
-					requestRequeue = false
+					return status, 0, err
 				}
-				return status, err
+				return status, 0, err
 			},
 		},
 		{
 			name: "verifying Freight for Stage",
-			reconcile: func() (kargoapi.StageStatus, error) {
+			reconcile: func() (kargoapi.StageStatus, time.Duration, error) {
 				status, err := r.markFreightVerifiedForStage(ctx, stage)
 				if err != nil {
 					err = fmt.Errorf("failed to verify Freight for Stage: %w", err)
 				}
-				return status, err
+				return status, 0, err
 			},
 		},
 		{
 			name: "auto-promoting Freight",
-			reconcile: func() (kargoapi.StageStatus, error) {
-				status, err := r.autoPromoteFreight(ctx, stage)
+			reconcile: func() (kargoapi.StageStatus, time.Duration, error) {
+				status, nextRequeue, err := r.autoPromoteFreight(ctx, stage)
 				if err != nil {
 					err = fmt.Errorf("failed to auto-promote Freight: %w", err)
 				}
-				return status, err
+				return status, nextRequeue, err
 			},
 		},
 	}
@@ -527,7 +527,16 @@ func (r *RegularStageReconciler) reconcile(
 
 		// Reconcile the Stage with the sub-reconciler.
 		var err error
-		newStatus, err = subR.reconcile()
+		var subRequeueAfter time.Duration
+		newStatus, subRequeueAfter, err = subR.reconcile()
+
+		// Track the earliest requeue time requested by any sub-reconciler.
+		// A value of 0 means the sub-reconciler didn't request a specific requeue.
+		if subRequeueAfter > 0 {
+			if requeueAfter == 0 || subRequeueAfter < requeueAfter {
+				requeueAfter = subRequeueAfter
+			}
+		}
 
 		// Summarize the conditions after each sub-reconciler to ensure that
 		// we have a consistent view of the Stage status.
@@ -536,7 +545,7 @@ func (r *RegularStageReconciler) reconcile(
 		// If an error occurred during the sub-reconciler, then we should
 		// return the error which will cause the Stage to be requeued.
 		if err != nil {
-			return newStatus, false, err
+			return newStatus, 0, err
 		}
 
 		// Patch the status of the Stage after each sub-reconciler to show
@@ -551,11 +560,11 @@ func (r *RegularStageReconciler) reconcile(
 	// If an immediate requeue was not requested, then we can delete the
 	// Reconciling condition as we have finished reconciling the Stage
 	// and did not encounter any errors.
-	if !requestRequeue {
+	if requeueAfter != 100*time.Millisecond {
 		conditions.Delete(&newStatus, kargoapi.ConditionTypeReconciling)
 	}
 
-	return newStatus, requestRequeue, nil
+	return newStatus, requeueAfter, nil
 }
 
 // syncPromotions synchronizes the Promotions for a Stage. It determines the
@@ -1159,9 +1168,9 @@ func (r *RegularStageReconciler) verifyStageFreight(
 		for _, ref := range curFreight.Freight {
 			r.recordFreightVerificationEvent(stage, ref, &newVI)
 		}
+
 		return newStatus, nil
 	}
-
 	// Start a new (re-)verification.
 	newVI, err = r.startVerification(ctx, stage, *curFreight, reverifyReq, startTime)
 	if newVI != nil {
@@ -1698,11 +1707,13 @@ func (r *RegularStageReconciler) findExistingAnalysisRun(
 
 // autoPromoteFreight automatically promotes the latest promotable (i.e.
 // verified) Freight for a Stage if auto-promotion is allowed (see
-// autoPromotionAllowed).
+// autoPromotionAllowed). It returns the Stage status, a duration after which
+// to requeue if there's Freight close to meeting soak time requirements, and
+// an error if one occurred.
 func (r *RegularStageReconciler) autoPromoteFreight(
 	ctx context.Context,
 	stage *kargoapi.Stage,
-) (kargoapi.StageStatus, error) {
+) (kargoapi.StageStatus, time.Duration, error) {
 	logger := logging.LoggerFromContext(ctx)
 	newStatus := *stage.Status.DeepCopy()
 
@@ -1710,21 +1721,25 @@ func (r *RegularStageReconciler) autoPromoteFreight(
 	// NB: This should not happen in practice, as a Stage cannot exist without
 	// requested Freight.
 	if len(stage.Spec.RequestedFreight) == 0 {
-		return newStatus, nil
+		return newStatus, 0, nil
 	}
 
 	// Confirm that auto-promotion is allowed for the Stage.
 	if autoPromotionAllowed, err := r.autoPromotionAllowed(ctx, stage.ObjectMeta); err != nil || !autoPromotionAllowed {
 		newStatus.AutoPromotionEnabled = false
-		return newStatus, err
+		return newStatus, 0, err
 	}
 	newStatus.AutoPromotionEnabled = true
 
 	// Retrieve promotable Freight for the Stage.
 	promotableFreight, err := r.getPromotableFreight(ctx, stage)
 	if err != nil {
-		return newStatus, err
+		return newStatus, 0, err
 	}
+
+	// Calculate when to requeue based on freight that is soaking but hasn't
+	// met soak time requirements yet.
+	nextSoakCheck := r.calculateNextSoakCheck(ctx, stage)
 
 	// If the Stage has no current Freight, then we can promote any available
 	currentFreight := newStatus.FreightHistory.Current()
@@ -1742,7 +1757,7 @@ func (r *RegularStageReconciler) autoPromoteFreight(
 		if req.Sources.AutoPromotionOptions != nil &&
 			req.Sources.AutoPromotionOptions.SelectionPolicy == kargoapi.AutoPromotionSelectionPolicyMatchUpstream &&
 			len(freight) > 1 {
-			return newStatus, fmt.Errorf(
+			return newStatus, 0, fmt.Errorf(
 				"unexpectedly found %d available Freight running immediately "+
 					"upstream from Stage %q in namespace %q; this should not be "+
 					"possible",
@@ -1801,7 +1816,7 @@ func (r *RegularStageReconciler) autoPromoteFreight(
 				},
 				client.Limit(1),
 			); err != nil {
-				return newStatus, fmt.Errorf(
+				return newStatus, 0, fmt.Errorf(
 					"error listing existing non-terminal Promotions for Freight %q "+
 						"in namespace %q: %w",
 					latestFreight.Name, stage.Namespace, err,
@@ -1834,7 +1849,7 @@ func (r *RegularStageReconciler) autoPromoteFreight(
 				},
 				client.Limit(1),
 			); err != nil {
-				return newStatus, fmt.Errorf(
+				return newStatus, 0, fmt.Errorf(
 					"error listing existing terminal Promotions for Freight %q in "+
 						"namespace %q: %w",
 					latestFreight.Name, stage.Namespace, err,
@@ -1887,7 +1902,7 @@ func (r *RegularStageReconciler) autoPromoteFreight(
 				},
 				client.Limit(1),
 			); err != nil {
-				return newStatus, fmt.Errorf(
+				return newStatus, 0, fmt.Errorf(
 					"error listing existing Promotions for Freight %q in namespace %q: %w",
 					latestFreight.Name, stage.Namespace, err,
 				)
@@ -1902,13 +1917,13 @@ func (r *RegularStageReconciler) autoPromoteFreight(
 		promotion, err := kargo.NewPromotionBuilder(r.client).
 			Build(ctx, *stage, latestFreight.Name)
 		if err != nil {
-			return newStatus, fmt.Errorf(
+			return newStatus, 0, fmt.Errorf(
 				"error building Promotion for Freight %q in namespace %q: %w",
 				latestFreight.Name, stage.Namespace, err,
 			)
 		}
 		if err = r.client.Create(ctx, promotion); err != nil {
-			return newStatus, fmt.Errorf(
+			return newStatus, 0, fmt.Errorf(
 				"error creating Promotion for Freight %q in namespace %q: %w",
 				latestFreight.Name, stage.Namespace, err,
 			)
@@ -1930,7 +1945,7 @@ func (r *RegularStageReconciler) autoPromoteFreight(
 		)
 	}
 
-	return newStatus, nil
+	return newStatus, nextSoakCheck, nil
 }
 
 // autoPromotionAllowed checks if auto-promotion is allowed for the given Stage.
@@ -2025,6 +2040,130 @@ func (r *RegularStageReconciler) getPromotableFreight(
 	}
 
 	return promotableFreight, nil
+}
+
+// calculateNextSoakCheck calculates when the reconciler should next check
+// for freight that might meet soak time requirements. It returns the duration
+// after which to requeue, or 0 if no freight is currently soaking.
+func (r *RegularStageReconciler) calculateNextSoakCheck(
+	ctx context.Context,
+	stage *kargoapi.Stage,
+) time.Duration {
+	logger := logging.LoggerFromContext(ctx)
+
+	var minWaitTime time.Duration
+
+	// Check each freight request to see if there's freight that's soaking
+	// but hasn't met the soak time requirement yet.
+	for _, req := range stage.Spec.RequestedFreight {
+		// Skip if this request doesn't have a soak time requirement
+		if req.Sources.RequiredSoakTime == nil {
+			continue
+		}
+
+		// Skip if this freight comes directly from a warehouse
+		if req.Sources.Direct {
+			continue
+		}
+
+		requiredSoak := req.Sources.RequiredSoakTime.Duration
+
+		// Get the warehouse for this origin
+		warehouse := &kargoapi.Warehouse{}
+		if err := r.client.Get(ctx, types.NamespacedName{
+			Namespace: stage.Namespace,
+			Name:      req.Origin.Name,
+		}, warehouse); err != nil {
+			logger.Error(err, "failed to get Warehouse", "warehouse", req.Origin.Name)
+			continue
+		}
+
+		// List all freight from this warehouse that's verified in upstream stages
+		// but might not have met soak requirements yet
+		opts := &api.ListWarehouseFreightOptions{
+			VerifiedIn:           req.Sources.Stages,
+			AvailabilityStrategy: req.Sources.AvailabilityStrategy,
+			// Don't filter by RequiredSoakTime - we want ALL freight including those still soaking
+		}
+		allFreight, err := api.ListFreightFromWarehouse(ctx, r.client, warehouse, opts)
+		if err != nil {
+			logger.Error(err, "failed to list freight from warehouse", "warehouse", warehouse.Name)
+			continue
+		}
+
+		// Check each freight to see how long until it meets soak requirements
+		for _, f := range allFreight {
+			// Calculate time remaining for this freight to meet soak requirements
+			timeRemaining := r.calculateFreightSoakTimeRemaining(&f, req.Sources.Stages, requiredSoak, req.Sources.AvailabilityStrategy)
+
+			if timeRemaining > 0 {
+				// This freight is soaking but hasn't met requirements yet
+				if minWaitTime == 0 || timeRemaining < minWaitTime {
+					minWaitTime = timeRemaining
+				}
+			}
+		}
+	}
+
+	// Add a small buffer to avoid racing with the exact moment soak time is met
+	if minWaitTime > 0 {
+		minWaitTime += 1 * time.Second
+		logger.Debug("calculated next soak check time", "requeueAfter", minWaitTime)
+	}
+
+	return minWaitTime
+}
+
+// calculateFreightSoakTimeRemaining calculates how long until the given freight
+// meets the soak time requirements for the given stages and availability strategy.
+// Returns 0 if the freight already meets requirements or will never meet them.
+func (r *RegularStageReconciler) calculateFreightSoakTimeRemaining(
+	freight *kargoapi.Freight,
+	requiredStages []string,
+	requiredSoak time.Duration,
+	strategy kargoapi.FreightAvailabilityStrategy,
+) time.Duration {
+	if strategy == kargoapi.FreightAvailabilityStrategyAll {
+		// For "All" strategy, freight must be soaked in ALL required stages.
+		// Find the stage with the LEAST soak time (the bottleneck).
+		var maxRemaining time.Duration
+		for _, stage := range requiredStages {
+			if !freight.IsVerifiedIn(stage) {
+				// Freight not verified in this stage, so it will never meet requirements
+				return 0
+			}
+			currentSoak := freight.GetLongestSoak(stage)
+			if remaining := requiredSoak - currentSoak; remaining > 0 {
+				if remaining > maxRemaining {
+					maxRemaining = remaining
+				}
+			}
+		}
+		return maxRemaining
+	}
+
+	// For "OneOf" strategy, freight just needs to be soaked in ANY stage.
+	// Find the stage with the MOST soak time (closest to meeting requirements).
+	var minRemaining time.Duration
+	foundAtLeastOne := false
+	for _, stage := range requiredStages {
+		if !freight.IsVerifiedIn(stage) {
+			continue
+		}
+		currentSoak := freight.GetLongestSoak(stage)
+		remaining := requiredSoak - currentSoak
+		if remaining > 0 {
+			if !foundAtLeastOne || remaining < minRemaining {
+				minRemaining = remaining
+				foundAtLeastOne = true
+			}
+		} else {
+			// This freight already meets requirements in at least one stage
+			return 0
+		}
+	}
+
+	return minRemaining
 }
 
 // handleDelete handles the deletion of the given Stage. It clears the

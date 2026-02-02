@@ -441,7 +441,7 @@ func TestRegularStagesReconciler_reconcile(t *testing.T) {
 		stage       *kargoapi.Stage
 		objects     []client.Object
 		interceptor interceptor.Funcs
-		assertions  func(*testing.T, kargoapi.StageStatus, bool, error)
+		assertions  func(*testing.T, kargoapi.StageStatus, time.Duration, error)
 	}{
 		{
 			name: "subreconciler error preserves reconciling condition",
@@ -457,9 +457,9 @@ func TestRegularStagesReconciler_reconcile(t *testing.T) {
 					return fmt.Errorf("forced error")
 				},
 			},
-			assertions: func(t *testing.T, status kargoapi.StageStatus, requeue bool, err error) {
+			assertions: func(t *testing.T, status kargoapi.StageStatus, requeue time.Duration, err error) {
 				require.Error(t, err)
-				require.False(t, requeue)
+				require.Zero(t, requeue)
 
 				reconciling := conditions.Get(&status, kargoapi.ConditionTypeReconciling)
 				require.NotNil(t, reconciling)
@@ -476,9 +476,9 @@ func TestRegularStagesReconciler_reconcile(t *testing.T) {
 					Generation: 1,
 				},
 			},
-			assertions: func(t *testing.T, status kargoapi.StageStatus, requeue bool, err error) {
+			assertions: func(t *testing.T, status kargoapi.StageStatus, requeue time.Duration, err error) {
 				require.NoError(t, err)
-				require.False(t, requeue)
+				require.Zero(t, requeue)
 
 				// Each subreconciler should have updated conditions
 				healthyCond := conditions.Get(&status, kargoapi.ConditionTypeHealthy)
@@ -505,9 +505,9 @@ func TestRegularStagesReconciler_reconcile(t *testing.T) {
 					},
 				},
 			},
-			assertions: func(t *testing.T, status kargoapi.StageStatus, requeue bool, err error) {
+			assertions: func(t *testing.T, status kargoapi.StageStatus, requeue time.Duration, err error) {
 				require.NoError(t, err)
-				assert.False(t, requeue)
+				assert.Zero(t, requeue)
 
 				reconciling := conditions.Get(&status, kargoapi.ConditionTypeReconciling)
 				assert.Nil(t, reconciling)
@@ -6193,7 +6193,7 @@ func TestRegularStageReconciler_autoPromoteFreight(t *testing.T) {
 				eventSender: k8sevent.NewEventSender(recorder),
 			}
 
-			status, err := r.autoPromoteFreight(context.Background(), tt.stage)
+			status, _, err := r.autoPromoteFreight(context.Background(), tt.stage)
 			tt.assertions(t, recorder, c, status, err)
 		})
 	}
@@ -6883,6 +6883,215 @@ func Test_buildFreightSummary(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := buildFreightSummary(tt.requested, tt.current)
 			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestRegularStageReconciler_calculateFreightSoakTimeRemaining(t *testing.T) {
+	now := time.Now()
+	twoMinutesAgo := &metav1.Time{Time: now.Add(-2 * time.Minute)}
+	thirtySecondsAgo := &metav1.Time{Time: now.Add(-30 * time.Second)}
+
+	tests := []struct {
+		name           string
+		freight        *kargoapi.Freight
+		requiredStages []string
+		requiredSoak   time.Duration
+		strategy       kargoapi.FreightAvailabilityStrategy
+		assertions     func(*testing.T, time.Duration)
+	}{
+		{
+			name: "All strategy - freight currently in all stages, already soaked",
+			freight: &kargoapi.Freight{
+				Status: kargoapi.FreightStatus{
+					VerifiedIn: map[string]kargoapi.VerifiedStage{
+						"stage-1": {VerifiedAt: twoMinutesAgo},
+						"stage-2": {VerifiedAt: twoMinutesAgo},
+					},
+					CurrentlyIn: map[string]kargoapi.CurrentStage{
+						"stage-1": {Since: twoMinutesAgo},
+						"stage-2": {Since: twoMinutesAgo},
+					},
+				},
+			},
+			requiredStages: []string{"stage-1", "stage-2"},
+			requiredSoak:   1 * time.Minute,
+			strategy:       kargoapi.FreightAvailabilityStrategyAll,
+			assertions: func(t *testing.T, remaining time.Duration) {
+				assert.Equal(t, time.Duration(0), remaining)
+			},
+		},
+		{
+			name: "All strategy - freight currently in all stages, still soaking",
+			freight: &kargoapi.Freight{
+				Status: kargoapi.FreightStatus{
+					VerifiedIn: map[string]kargoapi.VerifiedStage{
+						"stage-1": {VerifiedAt: twoMinutesAgo},
+						"stage-2": {VerifiedAt: thirtySecondsAgo},
+					},
+					CurrentlyIn: map[string]kargoapi.CurrentStage{
+						"stage-1": {Since: twoMinutesAgo},
+						"stage-2": {Since: thirtySecondsAgo},
+					},
+				},
+			},
+			requiredStages: []string{"stage-1", "stage-2"},
+			requiredSoak:   1 * time.Minute,
+			strategy:       kargoapi.FreightAvailabilityStrategyAll,
+			assertions: func(t *testing.T, remaining time.Duration) {
+				// Should be approximately 30 seconds (1m - 30s elapsed in stage-2)
+				assert.Greater(t, remaining, 20*time.Second)
+				assert.Less(t, remaining, 40*time.Second)
+			},
+		},
+		{
+			name: "All strategy - freight not verified in all stages",
+			freight: &kargoapi.Freight{
+				Status: kargoapi.FreightStatus{
+					VerifiedIn: map[string]kargoapi.VerifiedStage{
+						"stage-1": {VerifiedAt: twoMinutesAgo},
+					},
+				},
+			},
+			requiredStages: []string{"stage-1", "stage-2"},
+			requiredSoak:   1 * time.Minute,
+			strategy:       kargoapi.FreightAvailabilityStrategyAll,
+			assertions: func(t *testing.T, remaining time.Duration) {
+				assert.Equal(t, time.Duration(0), remaining)
+			},
+		},
+		{
+			name: "OneOf strategy - freight currently in one stage, already soaked",
+			freight: &kargoapi.Freight{
+				Status: kargoapi.FreightStatus{
+					VerifiedIn: map[string]kargoapi.VerifiedStage{
+						"stage-1": {VerifiedAt: twoMinutesAgo},
+					},
+					CurrentlyIn: map[string]kargoapi.CurrentStage{
+						"stage-1": {Since: twoMinutesAgo},
+					},
+				},
+			},
+			requiredStages: []string{"stage-1", "stage-2"},
+			requiredSoak:   1 * time.Minute,
+			strategy:       kargoapi.FreightAvailabilityStrategyOneOf,
+			assertions: func(t *testing.T, remaining time.Duration) {
+				assert.Equal(t, time.Duration(0), remaining)
+			},
+		},
+		{
+			name: "OneOf strategy - freight currently in one stage, still soaking",
+			freight: &kargoapi.Freight{
+				Status: kargoapi.FreightStatus{
+					VerifiedIn: map[string]kargoapi.VerifiedStage{
+						"stage-1": {VerifiedAt: thirtySecondsAgo},
+					},
+					CurrentlyIn: map[string]kargoapi.CurrentStage{
+						"stage-1": {Since: thirtySecondsAgo},
+					},
+				},
+			},
+			requiredStages: []string{"stage-1", "stage-2"},
+			requiredSoak:   1 * time.Minute,
+			strategy:       kargoapi.FreightAvailabilityStrategyOneOf,
+			assertions: func(t *testing.T, remaining time.Duration) {
+				// Should be approximately 30 seconds
+				assert.Greater(t, remaining, 20*time.Second)
+				assert.Less(t, remaining, 40*time.Second)
+			},
+		},
+		{
+			name: "OneOf strategy - freight currently in multiple stages, use best one",
+			freight: &kargoapi.Freight{
+				Status: kargoapi.FreightStatus{
+					VerifiedIn: map[string]kargoapi.VerifiedStage{
+						"stage-1": {VerifiedAt: twoMinutesAgo},
+						"stage-2": {VerifiedAt: thirtySecondsAgo},
+					},
+					CurrentlyIn: map[string]kargoapi.CurrentStage{
+						"stage-1": {Since: twoMinutesAgo},
+						"stage-2": {Since: thirtySecondsAgo},
+					},
+				},
+			},
+			requiredStages: []string{"stage-1", "stage-2"},
+			requiredSoak:   1 * time.Minute,
+			strategy:       kargoapi.FreightAvailabilityStrategyOneOf,
+			assertions: func(t *testing.T, remaining time.Duration) {
+				// Should be 0 because stage-1 already met the requirement
+				assert.Equal(t, time.Duration(0), remaining)
+			},
+		},
+		{
+			name: "OneOf strategy - freight not verified in any stage",
+			freight: &kargoapi.Freight{
+				Status: kargoapi.FreightStatus{
+					VerifiedIn: map[string]kargoapi.VerifiedStage{},
+				},
+			},
+			requiredStages: []string{"stage-1", "stage-2"},
+			requiredSoak:   1 * time.Minute,
+			strategy:       kargoapi.FreightAvailabilityStrategyOneOf,
+			assertions: func(t *testing.T, remaining time.Duration) {
+				assert.Equal(t, time.Duration(0), remaining)
+			},
+		},
+		{
+			name: "zero soak time required",
+			freight: &kargoapi.Freight{
+				Status: kargoapi.FreightStatus{
+					VerifiedIn: map[string]kargoapi.VerifiedStage{
+						"stage-1": {VerifiedAt: thirtySecondsAgo},
+					},
+					CurrentlyIn: map[string]kargoapi.CurrentStage{
+						"stage-1": {Since: thirtySecondsAgo},
+					},
+				},
+			},
+			requiredStages: []string{"stage-1"},
+			requiredSoak:   0,
+			strategy:       kargoapi.FreightAvailabilityStrategyAll,
+			assertions: func(t *testing.T, remaining time.Duration) {
+				assert.Equal(t, time.Duration(0), remaining)
+			},
+		},
+		{
+			name: "All strategy - using longest completed soak",
+			freight: &kargoapi.Freight{
+				Status: kargoapi.FreightStatus{
+					VerifiedIn: map[string]kargoapi.VerifiedStage{
+						"stage-1": {
+							VerifiedAt:           twoMinutesAgo,
+							LongestCompletedSoak: &metav1.Duration{Duration: 2 * time.Minute},
+						},
+						"stage-2": {
+							VerifiedAt:           twoMinutesAgo,
+							LongestCompletedSoak: &metav1.Duration{Duration: 30 * time.Second},
+						},
+					},
+				},
+			},
+			requiredStages: []string{"stage-1", "stage-2"},
+			requiredSoak:   1 * time.Minute,
+			strategy:       kargoapi.FreightAvailabilityStrategyAll,
+			assertions: func(t *testing.T, remaining time.Duration) {
+				// stage-2 only has 30s completed soak, needs 30s more
+				assert.Greater(t, remaining, 20*time.Second)
+				assert.Less(t, remaining, 40*time.Second)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &RegularStageReconciler{}
+			remaining := r.calculateFreightSoakTimeRemaining(
+				tt.freight,
+				tt.requiredStages,
+				tt.requiredSoak,
+				tt.strategy,
+			)
+			tt.assertions(t, remaining)
 		})
 	}
 }
